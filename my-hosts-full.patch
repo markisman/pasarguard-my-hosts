@@ -1,0 +1,526 @@
+diff --git a/app/core/admin_host_overrides.py b/app/core/admin_host_overrides.py
+new file mode 100644
+index 0000000..fcb34a1
+--- /dev/null
++++ b/app/core/admin_host_overrides.py
+@@ -0,0 +1,28 @@
++from aiocache import cached
++
++from app.db import GetDB
++from app.db.crud.admin_host_override import get_overrides
++
++
++@cached(ttl=30)
++async def get_admin_host_overrides(admin_id: int) -> dict[int, dict]:
++    """Cached {host_id: {display_name, sort_order, is_disabled}} for an admin."""
++    if not admin_id:
++        return {}
++    async with GetDB() as db:
++        rows = await get_overrides(db, admin_id)
++    return {
++        row.host_id: {
++            "display_name": row.display_name,
++            "sort_order": row.sort_order,
++            "is_disabled": row.is_disabled,
++        }
++        for row in rows
++    }
++
++
++async def invalidate_admin_host_overrides() -> None:
++    try:
++        await get_admin_host_overrides.cache.clear()
++    except Exception:
++        pass
+diff --git a/app/db/crud/admin_host_override.py b/app/db/crud/admin_host_override.py
+new file mode 100644
+index 0000000..e23aca0
+--- /dev/null
++++ b/app/db/crud/admin_host_override.py
+@@ -0,0 +1,60 @@
++from sqlalchemy import select
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from app.db.models import AdminHostOverride
++
++
++async def get_overrides(db: AsyncSession, admin_id: int) -> list[AdminHostOverride]:
++    result = await db.execute(
++        select(AdminHostOverride).where(AdminHostOverride.admin_id == admin_id)
++    )
++    return list(result.scalars().all())
++
++
++async def replace_overrides(
++    db: AsyncSession,
++    admin_id: int,
++    items: list[dict],
++) -> list[AdminHostOverride]:
++    """Bulk upsert for one admin. Items not present are removed.
++
++    Each item: {"host_id": int, "display_name": str|None, "sort_order": int|None, "is_disabled": bool}
++    """
++    existing_rows = await get_overrides(db, admin_id)
++    existing = {row.host_id: row for row in existing_rows}
++
++    seen: set[int] = set()
++    for item in items:
++        host_id = int(item["host_id"])
++        seen.add(host_id)
++        row = existing.get(host_id)
++        if row is None:
++            row = AdminHostOverride(admin_id=admin_id, host_id=host_id)
++            db.add(row)
++        row.display_name = item.get("display_name") or None
++        row.sort_order = item.get("sort_order")
++        row.is_disabled = bool(item.get("is_disabled", False))
++
++    # Remove overrides for hosts the admin no longer customizes
++    for host_id, row in existing.items():
++        if host_id not in seen:
++            await db.delete(row)
++
++    await db.commit()
++
++    # Return the current set
++    return await get_overrides(db, admin_id)
++
++
++async def delete_overrides_for_host(db: AsyncSession, host_id: int) -> None:
++    rows = (await db.execute(select(AdminHostOverride).where(AdminHostOverride.host_id == host_id))).scalars().all()
++    for row in rows:
++        await db.delete(row)
++    await db.commit()
++
++
++async def delete_overrides_for_admin(db: AsyncSession, admin_id: int) -> None:
++    rows = (await db.execute(select(AdminHostOverride).where(AdminHostOverride.admin_id == admin_id))).scalars().all()
++    for row in rows:
++        await db.delete(row)
++    await db.commit()
+diff --git a/app/db/migrations/versions/mh0st0v3r1ds_add_admin_host_overrides.py b/app/db/migrations/versions/mh0st0v3r1ds_add_admin_host_overrides.py
+new file mode 100644
+index 0000000..b3fd2f5
+--- /dev/null
++++ b/app/db/migrations/versions/mh0st0v3r1ds_add_admin_host_overrides.py
+@@ -0,0 +1,39 @@
++"""add admin_host_overrides (feature: My Hosts)
++
++Revision ID: mh0st0v3r1ds
++Revises: <c9b48df42f10>
++Create Date: 2026-10-15
++
++NOTE: set `down_revision` to the current head. Find it with:
++    docker exec pasarguard-pasarguard-1 alembic heads
++or
++    ls app/db/migrations/versions | tail
++"""
++import sqlalchemy as sa
++from alembic import op
++
++revision = "mh0st0v3r1ds"
++down_revision = "c9b48df42f10"
++branch_labels = None
++depends_on = None
++
++
++def upgrade() -> None:
++    op.create_table(
++        "admin_host_overrides",
++        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
++        sa.Column("admin_id", sa.BigInteger(), sa.ForeignKey("admins.id", ondelete="CASCADE"), nullable=False),
++        sa.Column("host_id", sa.BigInteger(), sa.ForeignKey("hosts.id", ondelete="CASCADE"), nullable=False),
++        sa.Column("display_name", sa.String(256), nullable=True),
++        sa.Column("sort_order", sa.Integer(), nullable=True),
++        sa.Column("is_disabled", sa.Boolean(), nullable=False, server_default=sa.text("0")),
++        sa.UniqueConstraint("admin_id", "host_id", name="uix_admin_host_override"),
++    )
++    op.create_index("ix_admin_host_overrides_admin_id", "admin_host_overrides", ["admin_id"])
++    op.create_index("ix_admin_host_overrides_host_id", "admin_host_overrides", ["host_id"])
++
++
++def downgrade() -> None:
++    op.drop_index("ix_admin_host_overrides_host_id", table_name="admin_host_overrides")
++    op.drop_index("ix_admin_host_overrides_admin_id", table_name="admin_host_overrides")
++    op.drop_table("admin_host_overrides")
+diff --git a/app/db/models.py b/app/db/models.py
+index d0b0f57..edd7655 100644
+--- a/app/db/models.py
++++ b/app/db/models.py
+@@ -1005,3 +1005,31 @@ class TempKey(Base):
+     expires_at: Mapped[dt] = mapped_column(DateTime(timezone=True))
+     used_at: Mapped[dt | None] = mapped_column(DateTime(timezone=True), default=None)
+     used_by_ip: Mapped[str | None] = mapped_column(String(45), default=None)
++
++# APPEND this class to app/db/models.py (near the other models, e.g. after ProxyHost).
++
++
++class AdminHostOverride(Base):
++    """Per-admin customization of a host (name / order / visibility).
++
++    Only affects the owning admin's own subscription output. Never changes the
++    global host row.
++    """
++
++    __tablename__ = "admin_host_overrides"
++
++    id: Mapped[int] = mapped_column(SqliteCompatibleBigInteger, primary_key=True, init=False, autoincrement=True)
++    admin_id: Mapped[int] = mapped_column(
++        SqliteCompatibleBigInteger, ForeignKey("admins.id", ondelete="CASCADE"), index=True
++    )
++    host_id: Mapped[int] = mapped_column(
++        SqliteCompatibleBigInteger, ForeignKey("hosts.id", ondelete="CASCADE"), index=True
++    )
++    # Custom remark; None => use the host's own remark
++    display_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
++    # Custom order; None => use the host's own priority
++    sort_order: Mapped[int | None] = mapped_column(nullable=True)
++    # Hide this host from the admin's own subscriptions
++    is_disabled: Mapped[bool] = mapped_column(default=False, server_default="0")
++
++    __table_args__ = (UniqueConstraint("admin_id", "host_id", name="uix_admin_host_override"),)
+diff --git a/app/models/admin_host_override.py b/app/models/admin_host_override.py
+new file mode 100644
+index 0000000..3a6c43b
+--- /dev/null
++++ b/app/models/admin_host_override.py
+@@ -0,0 +1,37 @@
++from pydantic import BaseModel, ConfigDict, Field
++
++
++class AdminHostOverrideItem(BaseModel):
++    host_id: int
++    display_name: str | None = None
++    sort_order: int | None = None
++    is_disabled: bool = False
++
++
++class AdminHostOverrideBulk(BaseModel):
++    items: list[AdminHostOverrideItem] = Field(default_factory=list)
++
++
++class AdminHostOverrideResponse(AdminHostOverrideItem):
++    model_config = ConfigDict(from_attributes=True)
++
++
++class MyHostResponse(BaseModel):
++    """A host as seen by the current admin, with their override applied."""
++
++    host_id: int
++    inbound_tag: str | None = None
++    address: list[str] = Field(default_factory=list)
++    port: int | None = None
++    # Default (global) values
++    remark: str
++    priority: int
++    is_disabled: bool = False
++    # This admin's override (None if not set)
++    display_name: str | None = None
++    sort_order: int | None = None
++    override_disabled: bool = False
++
++
++class MyHostsResponse(BaseModel):
++    hosts: list[MyHostResponse] = Field(default_factory=list)
+diff --git a/app/operation/my_hosts.py b/app/operation/my_hosts.py
+new file mode 100644
+index 0000000..75d44fa
+--- /dev/null
++++ b/app/operation/my_hosts.py
+@@ -0,0 +1,43 @@
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from app.core.admin_host_overrides import invalidate_admin_host_overrides
++from app.core.hosts import host_manager
++from app.db.crud.admin_host_override import get_overrides, replace_overrides
++
++
++class MyHostsOperation:
++    async def list_hosts(self, db: AsyncSession, admin_id: int) -> list[dict]:
++        hosts = await host_manager.get_hosts()  # dict[int, SubscriptionInboundData]
++        overrides = {row.host_id: row for row in await get_overrides(db, admin_id)}
++
++        result: list[dict] = []
++        for host_id, host_data in hosts.items():
++            ov = overrides.get(host_id)
++            port = None
++            if host_data.port:
++                port = host_data.port[0] if isinstance(host_data.port, list) else host_data.port
++            result.append(
++                {
++                    "host_id": host_id,
++                    "inbound_tag": host_data.inbound_tag,
++                    "address": list(host_data.address) if host_data.address else [],
++                    "port": port,
++                    "remark": host_data.remark,
++                    "priority": host_data.priority,
++                    "is_disabled": False,
++                    "display_name": ov.display_name if ov else None,
++                    "sort_order": ov.sort_order if ov else None,
++                    "override_disabled": bool(ov.is_disabled) if ov else False,
++                }
++            )
++
++        result.sort(key=lambda h: h["sort_order"] if h["sort_order"] is not None else h["priority"])
++        return result
++
++    async def save_hosts(self, db: AsyncSession, admin_id: int, items: list) -> None:
++        data = [it.model_dump() if hasattr(it, "model_dump") else dict(it) for it in items]
++        await replace_overrides(db, admin_id, data)
++        await invalidate_admin_host_overrides()
++
++
++my_hosts_operation = MyHostsOperation()
+diff --git a/app/routers/__init__.py b/app/routers/__init__.py
+index c7def10..1b6aae2 100644
+--- a/app/routers/__init__.py
++++ b/app/routers/__init__.py
+@@ -10,6 +10,7 @@ from . import (
+     home,
+     host,
+     hwid,
++    my_hosts,
+     node,
+     settings,
+     setup,
+@@ -33,6 +34,7 @@ routers = [
+     core.router,
+     client_template.router,
+     host.router,
++    my_hosts.router,
+     node.router,
+     user.router,
+     subscription.router,
+diff --git a/app/routers/my_hosts.py b/app/routers/my_hosts.py
+new file mode 100644
+index 0000000..d1adbd0
+--- /dev/null
++++ b/app/routers/my_hosts.py
+@@ -0,0 +1,31 @@
++from fastapi import APIRouter, Depends
++
++from app.db import AsyncSession, get_db
++from app.models.admin import AdminDetails
++from app.models.admin_host_override import AdminHostOverrideBulk, MyHostsResponse
++from app.operation.my_hosts import my_hosts_operation
++from app.routers.authentication import require_permission
++
++router = APIRouter(tags=["My Hosts"], prefix="/api/my_hosts")
++
++
++@router.get("", response_model=MyHostsResponse)
++async def list_my_hosts(
++    db: AsyncSession = Depends(get_db),
++    admin: AdminDetails = Depends(require_permission("hosts", "read")),
++):
++    """List hosts with THIS admin's customizations applied (name/order/visibility)."""
++    hosts = await my_hosts_operation.list_hosts(db, admin.id)
++    return {"hosts": hosts}
++
++
++@router.put("", response_model=MyHostsResponse)
++async def save_my_hosts(
++    model: AdminHostOverrideBulk,
++    db: AsyncSession = Depends(get_db),
++    admin: AdminDetails = Depends(require_permission("hosts", "read")),
++):
++    """Save THIS admin's host customizations. Only affects the caller's account."""
++    await my_hosts_operation.save_hosts(db, admin.id, model.items)
++    hosts = await my_hosts_operation.list_hosts(db, admin.id)
++    return {"hosts": hosts}
+diff --git a/app/subscription/share.py b/app/subscription/share.py
+index beb37a8..38a6f40 100644
+--- a/app/subscription/share.py
++++ b/app/subscription/share.py
+@@ -7,6 +7,7 @@ from datetime import UTC, datetime as dt, timedelta
+ from jdatetime import date as jd
+ 
+ from app.core.hosts import host_manager
++from app.core.admin_host_overrides import get_admin_host_overrides
+ from app.db.crud.wireguard import pick_peer_ip_for_inbound
+ from app.db.models import UserStatus
+ from app.models.status_emojis import STATUS_EMOJIS
+@@ -424,9 +425,30 @@ async def process_inbounds_and_tags(
+ ) -> str | bytes:
+     proxy_settings = user.proxy_settings.dict()
+     proxy_settings["_user_id"] = user.id
+-    hosts = await filter_hosts(list((await host_manager.get_hosts()).values()), user.status)
++    # --- My Hosts: apply the current admin's per-account customizations ---
++    host_map = await host_manager.get_hosts()
++    admin_id = getattr(getattr(user, "admin", None), "id", None)
++    overrides = await get_admin_host_overrides(admin_id) if admin_id else {}
++    hosts = []
++    for _hid, _hd in host_map.items():
++        if _hd.status and user.status not in _hd.status:
++            continue
++        _ov = overrides.get(_hid)
++        if _ov:
++            if _ov.get("is_disabled"):
++                continue
++            if _ov.get("display_name") or _ov.get("sort_order") is not None:
++                _hd = _hd.model_copy(deep=True)
++                if _ov.get("display_name"):
++                    _hd.remark = _ov["display_name"]
++                if _ov.get("sort_order") is not None:
++                    _hd.priority = _ov["sort_order"]
++        hosts.append(_hd)
++    # --- end My Hosts ---
+     if randomize_order and len(hosts) > 1:
+         random.shuffle(hosts)
++    else:
++        hosts.sort(key=lambda h: h.priority)
+ 
+     def _resolve_host_xray_template_content(inbound: SubscriptionInboundData) -> str | None:
+         if xray_template_overrides is None:
+diff --git a/dashboard/src/pages/_dashboard.my-hosts.tsx b/dashboard/src/pages/_dashboard.my-hosts.tsx
+new file mode 100644
+index 0000000..9d011f7
+--- /dev/null
++++ b/dashboard/src/pages/_dashboard.my-hosts.tsx
+@@ -0,0 +1,146 @@
++import PageHeader from '@/components/layout/page-header'
++import { Button } from '@/components/ui/button'
++import { Input } from '@/components/ui/input'
++import { Switch } from '@/components/ui/switch'
++import { Separator } from '@/components/ui/separator'
++import { useQuery } from '@tanstack/react-query'
++import { ArrowDown, ArrowUp, GripVertical, RotateCcw, Search } from 'lucide-react'
++import { useMemo, useState } from 'react'
++import { useTranslation } from 'react-i18next'
++import { toast } from 'sonner'
++
++type MyHost = {
++  host_id: number
++  remark: string
++  display_name: string | null
++  sort_order: number | null
++  override_disabled: boolean
++  priority: number
++}
++
++async function fetchMyHosts(): Promise<MyHost[]> {
++  const res = await fetch('/api/my_hosts', { credentials: 'include' })
++  if (!res.ok) throw new Error('failed to load hosts')
++  const data = await res.json()
++  return data.hosts as MyHost[]
++}
++
++async function saveMyHosts(items: MyHost[]): Promise<void> {
++  const res = await fetch('/api/my_hosts', {
++    method: 'PUT',
++    credentials: 'include',
++    headers: { 'Content-Type': 'application/json' },
++    body: JSON.stringify({
++      items: items.map(h => ({
++        host_id: h.host_id,
++        display_name: h.display_name || null,
++        sort_order: h.sort_order,
++        is_disabled: h.override_disabled,
++      })),
++    }),
++  })
++  if (!res.ok) throw new Error('failed to save hosts')
++}
++
++export default function MyHostsPage() {
++  const { t } = useTranslation()
++  const { data } = useQuery({ queryKey: ['my-hosts'], queryFn: fetchMyHosts })
++  const [draft, setDraft] = useState<MyHost[] | null>(null)
++  const [search, setSearch] = useState('')
++
++  const hosts = useMemo(() => {
++    const list = draft ?? data ?? []
++    const q = search.trim().toLowerCase()
++    const filtered = q ? list.filter(h => (h.display_name || h.remark).toLowerCase().includes(q)) : list
++    return [...filtered].sort((a, b) => (a.sort_order ?? a.priority) - (b.sort_order ?? b.priority))
++  }, [draft, data, search])
++
++  const update = (items: MyHost[]) => setDraft(items)
++
++  const move = (index: number, dir: -1 | 1) => {
++    const list = [...hosts]
++    const j = index + dir
++    if (j < 0 || j >= list.length) return
++    ;[list[index], list[j]] = [list[j], list[index]]
++    list.forEach((h, i) => (h.sort_order = i))
++    update(list)
++  }
++
++  const resetOrder = () => update(hosts.map(h => ({ ...h, sort_order: null })))
++  const resetAll = () => update(hosts.map(h => ({ ...h, sort_order: null, display_name: null, override_disabled: false })))
++
++  const save = async () => {
++    try {
++      await saveMyHosts(hosts)
++      toast.success(t('myHosts.saved', { defaultValue: 'Saved' }))
++      setDraft(null)
++    } catch {
++      toast.error('Save failed')
++    }
++  }
++
++  return (
++    <div className="flex flex-col gap-4">
++      <PageHeader
++        title={t('myHosts.title', { defaultValue: 'My Hosts' })}
++        description={t('myHosts.subtitle', { defaultValue: 'Change the server names and order shown to you. These changes only affect your account.' })}
++      />
++      <Separator />
++
++      <div className="flex items-center gap-2">
++        <div className="relative flex-1">
++          <Search className="absolute left-2 top-2.5 h-4 w-4 opacity-50" />
++          <Input
++            className="pl-8"
++            placeholder={t('myHosts.search', { defaultValue: 'Search hosts' })}
++            value={search}
++            onChange={e => setSearch(e.target.value)}
++          />
++        </div>
++        <Button variant="outline" onClick={resetOrder}>
++          <ArrowUp className="mr-2 h-4 w-4" />
++          {t('myHosts.resetOrder', { defaultValue: 'Reset order' })}
++        </Button>
++        <Button variant="outline" onClick={resetAll}>
++          <RotateCcw className="mr-2 h-4 w-4" />
++          {t('myHosts.resetAll', { defaultValue: 'Reset all' })}
++        </Button>
++        <Button onClick={save} disabled={!draft}>
++          {t('myHosts.save', { defaultValue: 'Save' })}
++        </Button>
++      </div>
++
++      <div className="flex flex-col gap-2">
++        {hosts.map((h, i) => (
++          <div key={h.host_id} className="flex items-center gap-2 rounded-lg border p-2">
++            <GripVertical className="h-4 w-4 opacity-40" />
++            <Input
++              className="flex-1"
++              value={h.display_name ?? ''}
++              placeholder={h.remark}
++              onChange={e => {
++                const list = [...hosts]
++                list[i] = { ...h, display_name: e.target.value }
++                update(list)
++              }}
++            />
++            <Button variant="outline" size="icon" onClick={() => move(i, -1)}>
++              <ArrowUp className="h-4 w-4" />
++            </Button>
++            <Button variant="outline" size="icon" onClick={() => move(i, 1)}>
++              <ArrowDown className="h-4 w-4" />
++            </Button>
++            <Switch
++              checked={!h.override_disabled}
++              onCheckedChange={v => {
++                const list = [...hosts]
++                list[i] = { ...h, override_disabled: !v }
++                update(list)
++              }}
++            />
++          </div>
++        ))}
++      </div>
++    </div>
++  )
++}
